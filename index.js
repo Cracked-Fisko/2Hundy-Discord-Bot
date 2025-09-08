@@ -48,6 +48,11 @@ const {
   TW_Chn,
   Socials_MENU_CHANNEL_ID,
   VOICE_MENU_CHANNEL_ID,
+  GUIDELINES_CHANNEL_ID,
+  ROLES_MENU_CHANNEL_ID,
+  ROLE_GAMES_ID,
+  ROLE_VIDEO_ID,
+  ROLE_NOTIFY_ID,
 } = process.env;
 
 /* --------------------------
@@ -96,6 +101,7 @@ const bannedWords = (readJSON(BANNED_WORDS_FILE).words || []).map((w) =>
   w.toLowerCase()
 );
 const offenses = new Map(); // runtime offenses per user (not persisted)
+const lastMessageTimestamps = new Map(); // userId -> timestamp of last message
 
 /* --------------------------
    Twitch / YouTube helpers
@@ -328,10 +334,13 @@ async function createVoiceChannelController(ownerId, voiceChannelRef) {
 /* --------------------------
    Ready
    -------------------------- */
-client.on("ready", async () => {
+client.on("clientReady", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 
   // send socials links on ready (once)
+  await postSocialsMessage();
+// Function to post socials message
+async function postSocialsMessage() {
   try {
     const channel = await client.channels.fetch(Socials_MENU_CHANNEL_ID).catch(() => null);
     if (channel && channel.isTextBased()) {
@@ -340,10 +349,14 @@ client.on("ready", async () => {
         { name: "YouTube", url: `https://www.youtube.com/channel/${YOUTUBE_CHANNEL_ID}` },
       ];
       await channel.send({ content: socials.map((s) => `🔗 **${s.name}:** ${s.url}`).join("\n") });
+      return true;
     }
+    return false;
   } catch (e) {
-    console.error("Failed posting socials on ready:", e);
+    console.error("Failed posting socials:", e);
+    return false;
   }
+}
 
   // Post ticket menu
   sendTicketMenu().catch((e) => console.error("sendTicketMenu error:", e));
@@ -455,33 +468,73 @@ async function sendVCMenu() {
 client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
-
+    const userId = message.author.id;
     const content = (message.content || "").toLowerCase();
     const hasLink = /(https?:\/\/[^\s]+)/.test(content);
     const hasAttachment = message.attachments.size > 0;
     const hasBannedWord = bannedWords.some((w) => w && content.includes(w));
 
-    if (hasLink || hasAttachment || hasBannedWord) {
-      // moderation
-      const userId = message.author.id;
+    // --- Spam protection ---
+    const now = Date.now();
+    const lastTs = lastMessageTimestamps.get(userId) || 0;
+    if (now - lastTs < 1000) { // less than 1s between messages
+      // treat as spam
       let count = offenses.get(userId) || 0;
       count++;
       offenses.set(userId, count);
+      lastMessageTimestamps.set(userId, now);
+      try {
+        if (message.deletable) await message.delete();
+      } catch (err) {
+        console.error("Failed to delete spam message:", err);
+      }
+      let member;
+      try {
+        member = await message.guild.members.fetch(userId);
+      } catch (err) {
+        member = null;
+      }
+      try {
+        if (count === 1) {
+          await message.channel.send(`⚠️ <@${userId}>, please slow down! Spam is not allowed.`);
+        } else if (count === 2) {
+          if (member?.moderatable) {
+            await member.timeout(5 * 60 * 1000, "Spam (2nd offense)");
+            await message.channel.send(`⏱️ <@${userId}>, you’ve been timed out for 5 minutes (spam).`);
+          } else {
+            await message.channel.send(`⚠️ <@${userId}>, warning: bot cannot timeout you, but your spam message was removed.`);
+          }
+        } else if (count >= 3) {
+          if (member?.moderatable) {
+            await member.timeout(60 * 60 * 1000, "Spam (3rd offense)");
+            await message.channel.send(`⏱️ <@${userId}>, you’ve been timed out for 1 hour (spam).`);
+          } else {
+            await message.channel.send(`⚠️ <@${userId}>, warning: bot cannot timeout you, but your spam message was removed.`);
+          }
+        }
+      } catch (err) {
+        await message.channel.send(`⚠️ Error applying spam moderation to <@${userId}>.`);
+      }
+      return;
+    }
+    lastMessageTimestamps.set(userId, now);
 
+    if (hasLink || hasAttachment || hasBannedWord) {
+      // moderation
+      let count = offenses.get(userId) || 0;
+      count++;
+      offenses.set(userId, count);
       try {
         if (message.deletable) await message.delete();
       } catch (err) {
         console.error("Failed to delete message:", err);
       }
-
       let member;
       try {
         member = await message.guild.members.fetch(userId);
       } catch (err) {
-        console.error("Failed to fetch member:", err);
         member = null;
       }
-
       try {
         if (count === 1) {
           await message.channel.send(`⚠️ <@${userId}>, that’s not allowed here. Your message has been removed.`);
@@ -501,10 +554,8 @@ client.on("messageCreate", async (message) => {
           }
         }
       } catch (err) {
-        console.error("Moderation action failed:", err);
         await message.channel.send(`⚠️ Error applying moderation to <@${userId}>. Check bot permissions.`);
       }
-
       // do NOT award XP for violating messages
       return;
     }
@@ -512,23 +563,13 @@ client.on("messageCreate", async (message) => {
     // ---- XP awarding (non-violating messages) ----
     try {
       const xpData = getXPData();
-      const userId = message.author.id;
       if (!xpData[userId]) xpData[userId] = { xp: 0, level: 0 };
-
-      // Add 0.05 XP per message
       xpData[userId].xp += 0.05;
-
-      // Level up logic: every 200 XP = level 1; formula uses (level+1)*200
       const neededXP = (xpData[userId].level + 1) * 200;
       if (xpData[userId].xp >= neededXP) {
         xpData[userId].level += 1;
         await message.channel.send(`🎉 Congrats <@${userId}>, you reached **Level ${xpData[userId].level}!**`);
-
-        // NOTE: we removed automatic VC creation on level-up.
-        // Users must click the permanent "Create VC" button in the VC hub,
-        // which will enforce they are level >= 1 before creating.
       }
-
       saveXPData(xpData);
     } catch (e) {
       console.error("XP system error:", e);
@@ -549,6 +590,22 @@ client.on("interactionCreate", async (interaction) => {
   try {
     // Slash commands
     if (interaction.isCommand()) {
+      if (interaction.commandName === "clear") {
+        // Only allow users with ManageMessages permission
+        const member = await interaction.guild.members.fetch(interaction.user.id);
+        if (!member.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
+          return interaction.reply({ content: "❌ You don't have permission to clear messages.", ephemeral: true });
+        }
+        const amount = parseInt(interaction.options.getInteger("amount"), 10) || 10;
+        const channel = interaction.channel;
+        try {
+          const deleted = await channel.bulkDelete(amount, true);
+          await interaction.reply({ content: `✅ Deleted ${deleted.size} messages.`, ephemeral: true });
+        } catch (e) {
+          await interaction.reply({ content: `❌ Failed to delete messages: ${e.message}`, ephemeral: true });
+        }
+        return;
+      }
       if (interaction.commandName === "verify") {
         const verifiedUsers = getVerifiedUsers();
         const userData = verifiedUsers[interaction.user.id];
@@ -617,6 +674,49 @@ client.on("interactionCreate", async (interaction) => {
           .setTimestamp();
 
         return interaction.reply({ embeds: [embed] });
+      }
+
+      if (interaction.commandName === "rsocial") {
+        // Only allow users with ManageMessages permission
+        const member = await interaction.guild.members.fetch(interaction.user.id);
+        if (!member.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
+          return interaction.reply({ content: "❌ You don't have permission to refresh socials.", ephemeral: true });
+        }
+        // Instantly post socials message in the current channel, including latest YouTube video
+        const socials = [   ];
+        let ytVideoText = "";
+        try {
+          const latestVideo = await getLatestYouTubeVideo();
+          if (latestVideo) {
+            ytVideoText = `▶️ **Latest YouTube Video:** [${latestVideo.title}](${latestVideo.url})`;
+          }
+        } catch {}
+        try {
+          await interaction.channel.send({ content: [
+            socials.map((s) => `🔗 **${s.name}:** ${s.url}`).join("\n"),
+            ytVideoText
+          ].filter(Boolean).join("\n\n") });
+        } catch (e) {
+          // ignore channel send error
+        }
+        // Always respond to the interaction so Discord doesn't timeout
+        if (!interaction.replied && !interaction.deferred) {
+          try {
+            await interaction.reply({ content: "✅ Socials message posted.", ephemeral: true });
+          } catch (e) {
+            // ignore reply error
+          }
+        }
+        return;
+      }
+
+      if (interaction.commandName === "guidelines") {
+        const member = await interaction.guild.members.fetch(interaction.user.id);
+        if (!member.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
+          return interaction.reply({ content: "❌ You don't have permission to post guidelines.", ephemeral: true });
+        }
+        await postGuidelinesMessage();
+        return interaction.reply({ content: "✅ Guidelines posted.", ephemeral: true });
       }
     }
 
@@ -924,6 +1024,26 @@ async function registerCommands() {
     { name: "verify", description: "Verify your Twitch subscription to get the role" },
     { name: "rank", description: "Check your XP and Level" },
     { name: "leaderboard", description: "Show the top XP earners" },
+    {
+      name: "clear",
+      description: "Bulk delete messages in this channel",
+      options: [
+        {
+          name: "amount",
+          description: "Number of messages to delete",
+          type: 4, // INTEGER
+          required: false,
+        },
+      ],
+    },
+    {
+      name: "rsocial",
+      description: "Admin: Refresh and post socials message",
+    },
+    {
+      name: "guidelines",
+      description: "Admin: Post the guidelines page",
+    },
   ];
   try {
     await rest.put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, GUILD_ID), { body: commands });
@@ -935,3 +1055,26 @@ async function registerCommands() {
 
 registerCommands().catch((e) => console.error(e));
 client.login(DISCORD_TOKEN).catch((e) => console.error("login error", e));
+
+async function postGuidelinesMessage() {
+  if (!GUIDELINES_CHANNEL_ID) return;
+  const channel = await client.channels.fetch(GUIDELINES_CHANNEL_ID).catch(() => null);
+  if (!channel || !channel.isTextBased()) return;
+  const imageUrl = process.env.GUIDELINES_IMAGE_URL || "https://yt3.googleusercontent.com/BCsEyurnU4RQJXRzpQAe109tL_u9uUP0cHmQIqahxMr-JT65iI-AbB2WSzsidHuaztQIKuEsuA=s160-c-k-c0x00ffffff-no-rj";
+  const embed = new EmbedBuilder()
+    .setColor(0x9b59b6) // purple
+    .setTitle("Guidelines @ 2Hundy Gang")
+    .setImage(imageUrl)
+    .addFields(
+      { name: "1 | Discord Terms of Service", value: "We as a community follow the Discord Terms of Service & Community Guidelines, failure to do so yourself will result in moderation such as a potential removal from the server." },
+      { name: "2 | Discrimination", value: "Discrimination of any kind will not be tolerated, we are strictly against any forms of racism, sexism or prejudice behaviour towards any individual." },
+      { name: "3 | Under 13", value: "Any individuals under the age of 13 will be removed from the server as per Discord Terms of Service." },
+      { name: "4 | Spamming & Mass Mentioning", value: "Any spamming or mass mentioning of other users or moderation & administration will result in a timeout 1 hour, if continued you will be kicked from the server." },
+      { name: "5 | NSFW & Obscene Content", value: "Content that depicts gore, sexual & explicit content will result in a permananent ban from the community, we'll also enforce any sexually motivated messages." },
+      { name: "6 | Support", value: "Support can be contacted via our tickets system, however, only contact support if it is absolutely vital or if you are trying to report a member of the server for a violation of our guidelines and a member of staff hadn't been in chat at the time." },
+      { name: "🛡️ Moderator's Discretion", value: "Moderator's have authorisation to moderate users on their ultimate say on a per case basis, however if you believe you were unfairly moderated, contact the Head of Moderation or an Administrator." }
+    )
+    .setFooter({ text: "2Hundy Gang" })
+    .setTimestamp();
+  await channel.send({ embeds: [embed] });
+}
