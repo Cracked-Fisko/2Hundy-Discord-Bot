@@ -29,6 +29,7 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessageReactions, // Added intent for message reactions
   ],
 });
 
@@ -114,14 +115,25 @@ async function getTwitchToken() {
   return res.json();
 }
 
-async function isTwitchSub(userId) {
+// Move Twitch helpers above verify command usage
+function getUserAccessToken(discordId) {
+  const verifiedUsers = readJSON(VERIFIED_FILE);
+  const user = verifiedUsers[discordId];
+  return user && user.twitchAccessToken ? user.twitchAccessToken : null;
+}
+
+async function isTwitchSub(userId, discordId) {
   try {
-    const tokenData = await getTwitchToken();
+    let accessToken = getUserAccessToken(discordId);
+    if (!accessToken) {
+      const tokenData = await getTwitchToken();
+      accessToken = tokenData.access_token;
+    }
     const res = await fetch(
       `https://api.twitch.tv/helix/subscriptions?broadcaster_id=${TWITCH_BROADCASTER_ID}&user_id=${userId}`,
       {
         headers: {
-          Authorization: `Bearer ${tokenData.access_token}`,
+          Authorization: `Bearer ${accessToken}`,
           "Client-Id": TWITCH_CLIENT_ID,
         },
       }
@@ -131,6 +143,28 @@ async function isTwitchSub(userId) {
   } catch (e) {
     console.error("isTwitchSub error", e);
     return false;
+  }
+}
+
+async function isTwitchFollower(twitchUserId, discordId) {
+  try {
+    let accessToken = getUserAccessToken(discordId);
+    if (!accessToken) {
+      const tokenData = await getTwitchToken();
+      accessToken = tokenData.access_token;
+    }
+    const url = `https://api.twitch.tv/helix/channels/followers?broadcaster_id=${TWITCH_BROADCASTER_ID}&user_id=${twitchUserId}`;
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Client-Id": TWITCH_CLIENT_ID,
+      },
+    });
+    const data = await res.json();
+    return data.data && data.data.length > 0;
+  } catch (e) {
+    console.error("isTwitchFollower error", e);
+    return null;
   }
 }
 
@@ -160,13 +194,14 @@ async function getLatestYouTubeVideo() {
       `https://www.googleapis.com/youtube/v3/channels?part=contentDetails&id=${YOUTUBE_CHANNEL_ID}&key=${YOUTUBE_API_KEY}`
     );
     const channelData = await channelRes.json();
-    const uploadsPlaylist =
-      channelData.items[0].contentDetails.relatedPlaylists.uploads;
+    if (!channelData.items || !channelData.items.length) return null;
+    const uploadsPlaylist = channelData.items[0].contentDetails.relatedPlaylists.uploads;
 
     const playlistRes = await fetch(
       `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=1&playlistId=${uploadsPlaylist}&key=${YOUTUBE_API_KEY}`
     );
     const playlistData = await playlistRes.json();
+    if (!playlistData.items || !playlistData.items.length) return null;
     const latest = playlistData.items[0].snippet;
 
     return {
@@ -314,6 +349,7 @@ async function createVoiceChannelController(ownerId, voiceChannelRef) {
     new ButtonBuilder().setCustomId(`vc_lock_${ownerId}`).setLabel("🔒 Lock").setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId(`vc_unlock_${ownerId}`).setLabel("🔓 Unlock").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`vc_rename_${ownerId}`).setLabel("✏️ Rename").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`vc_invite_${ownerId}`).setLabel("🤝 Invite").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`vc_delete_${ownerId}`).setLabel("🗑️ Delete").setStyle(ButtonStyle.Secondary),
   );
 
@@ -360,7 +396,7 @@ async function postSocialsMessage() {
 
   // Post ticket menu
   sendTicketMenu().catch((e) => console.error("sendTicketMenu error:", e));
-
+  postRolesEmbed();
   // Post a permanent VC hub/menu if not present
   try {
     await sendVCMenu();
@@ -569,6 +605,44 @@ client.on("messageCreate", async (message) => {
       if (xpData[userId].xp >= neededXP) {
         xpData[userId].level += 1;
         await message.channel.send(`🎉 Congrats <@${userId}>, you reached **Level ${xpData[userId].level}!**`);
+        // Role assignment logic
+        const guild = message.guild;
+        const levelRoleName = `Level ${xpData[userId].level}`;
+        let role = guild.roles.cache.find(r => r.name === levelRoleName);
+        if (!role) {
+          await guild.roles.create({
+            name: levelRoleName,
+            color: 0x3498db,
+            reason: `Auto-created for level ${xpData[userId].level}`
+          });
+          await guild.roles.fetch();
+          role = guild.roles.cache.find(r => r.name === levelRoleName);
+          let ticketChannel = null;
+          try {
+            ticketChannel = await guild.channels.create({
+              name: `ticket-level${xpData[userId].level}`,
+              type: ChannelType.GuildText,
+              permissionOverwrites: [
+                { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+                { id: String(userId), allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] },
+                ...(STAFF_ROLE_ID ? [{ id: String(STAFF_ROLE_ID), allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] }] : []),
+              ],
+            });
+          } catch (err) {
+            console.error('Failed to create ticket channel for level-up:', err);
+          }
+          if (ticketChannel) {
+            const tickets = getTickets();
+            tickets[ticketChannel.id] = { userId, status: "open", reason: `Role ${levelRoleName} auto-created` };
+            saveTickets(tickets);
+            const row = new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId("close_ticket").setLabel("Close Ticket").setStyle(ButtonStyle.Danger)
+            );
+            await ticketChannel.send({ content: `A new role **${levelRoleName}** was auto-created and assigned to <@${userId}>. Staff, please review.`, components: [row] });
+          }
+        }
+        const member = await guild.members.fetch(userId);
+        if (role && !member.roles.cache.has(role.id)) await member.roles.add(role);
       }
       saveXPData(xpData);
     } catch (e) {
@@ -609,41 +683,52 @@ client.on("interactionCreate", async (interaction) => {
       if (interaction.commandName === "verify") {
         const verifiedUsers = getVerifiedUsers();
         const userData = verifiedUsers[interaction.user.id];
-        if (!userData || !userData.twitchName) {
+        if (!userData || !userData.twitchName || !userData.twitchAccessToken) {
           const url = `${OAUTH_BASE_URL}/authorize?discordId=${interaction.user.id}`;
-          return interaction.reply({ content: `Click here to link your Twitch account: ${url}`, ephemeral: true });
+          return interaction.reply({ content: `Click here to link your Twitch account: ${url}`, flags: 64 });
         }
-
-        // Keep verification flow (unchanged) — attempt subscription check
         try {
-          const tokenData = await getTwitchToken();
+          // Use user access token for all Twitch API calls
+          const accessToken = userData.twitchAccessToken;
           const userRes = await fetch(`https://api.twitch.tv/helix/users?id=${userData.twitchId}`, {
-            headers: { "Client-Id": TWITCH_CLIENT_ID, Authorization: `Bearer ${tokenData.access_token}` },
+            headers: { "Client-Id": TWITCH_CLIENT_ID, Authorization: `Bearer ${accessToken}` },
           });
           const userJson = await userRes.json();
           if (!userJson.data || userJson.data.length === 0)
-            return interaction.reply({ content: "❌ Could not find Twitch account.", ephemeral: true });
-
+            return interaction.reply({ content: "❌ Could not find Twitch account.", flags: 64 });
           const twitchUserId = userJson.data[0].id;
-
+          // Check subscription
           const subRes = await fetch(
             `https://api.twitch.tv/helix/subscriptions?broadcaster_id=${TWITCH_BROADCASTER_ID}&user_id=${twitchUserId}`,
-            { headers: { "Client-Id": TWITCH_CLIENT_ID, Authorization: `Bearer ${tokenData.access_token}` } }
+            { headers: { "Client-Id": TWITCH_CLIENT_ID, Authorization: `Bearer ${accessToken}` } }
           );
           const subData = await subRes.json();
-
-          if (!subData.data || subData.data.length === 0)
-            return interaction.reply({ content: "❌ You are not subscribed to the Twitch channel.", ephemeral: true });
-
-          // Add role (DISCORD_ROLE_NAME should be the role ID in your .env)
           const member = await interaction.guild.members.fetch(interaction.user.id);
           const role = interaction.guild.roles.cache.get(DISCORD_ROLE_NAME);
-          if (role && !member.roles.cache.has(role.id)) await member.roles.add(role);
-
-          return interaction.reply({ content: `✅ Verified! Role added.`, ephemeral: true });
+          if (role && !member.roles.cache.has(role.id) && subData.data && subData.data.length > 0) await member.roles.add(role);
+          // Follower check
+          const followerRes = await fetch(
+            `https://api.twitch.tv/helix/channels/followers?broadcaster_id=${TWITCH_BROADCASTER_ID}&user_id=${twitchUserId}`,
+            { headers: { "Client-Id": TWITCH_CLIENT_ID, Authorization: `Bearer ${accessToken}` } }
+          );
+          const followerData = await followerRes.json();
+          const isFollower = followerData.data && followerData.data.length > 0;
+          if (isFollower) {
+            const kingJimRole = interaction.guild.roles.cache.find(r => r.name === "KingJim");
+            if (kingJimRole && !member.roles.cache.has(kingJimRole.id)) {
+              await member.roles.add(kingJimRole);
+            }
+          }
+          if (subData.data && subData.data.length > 0) {
+            return interaction.reply({ content: `✅ You are subscribed! Role added.${isFollower ? " You are also a follower and have been granted the KingJim role." : ""}`, flags: 64 });
+          } else if (isFollower) {
+            return interaction.reply({ content: `✅ You are not subscribed, but you follow the channel. You have been granted the KingJim role.`, flags: 64 });
+          } else {
+            return interaction.reply({ content: "❌ You are not subscribed or following the Twitch channel.", flags: 64 });
+          }
         } catch (e) {
           console.error("verify command error:", e);
-          return interaction.reply({ content: "❌ Verification failed (internal error).", ephemeral: true });
+          return interaction.reply({ content: "❌ Verification failed (internal error).", flags: 64 });
         }
       }
 
@@ -712,6 +797,7 @@ client.on("interactionCreate", async (interaction) => {
 
       if (interaction.commandName === "guidelines") {
         const member = await interaction.guild.members.fetch(interaction.user.id);
+        
         if (!member.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
           return interaction.reply({ content: "❌ You don't have permission to post guidelines.", ephemeral: true });
         }
@@ -763,10 +849,79 @@ if (interaction.isModalSubmit()) {
       console.error("vc rename modal error", e);
       return interaction.reply({ content: "❌ Failed to rename channel.", ephemeral: true });
     }
+  } else if (interaction.customId && interaction.customId.startsWith("vc_invite_modal_")) {
+    const ownerId = interaction.customId.split("_").slice(-1)[0];
+    const vch = getVChData();
+    const entry = vch[ownerId];
+    if (!entry || !entry.voiceChannelId) {
+      return interaction.reply({ content: "❌ VC record not found.", flags: 64 });
+    }
+    const member = await interaction.guild.members.fetch(interaction.user.id);
+    if (interaction.user.id !== ownerId && !member.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
+      return interaction.reply({ content: "❌ You don't have permission to invite users to this VC.", flags: 64 });
+    }
+    const raw = interaction.fields.getTextInputValue("vc_invite_user").trim();
+    // Accept user ID or mention
+    let targetId = null;
+    const mentionMatch = raw.match(/<@!?([0-9]{17,19})>/);
+    if (mentionMatch) {
+      targetId = mentionMatch[1];
+    } else {
+      const idMatch = raw.match(/\d{17,19}/);
+      if (idMatch) targetId = idMatch[0];
+    }
+    if (!targetId) {
+      return interaction.reply({ content: "❌ Provide a valid user ID or mention.", flags: 64 });
+    }
+    if (targetId === ownerId) {
+      return interaction.reply({ content: "⚠️ You are already the owner of this VC.", flags: 64 });
+    }
+    let voiceChannel = null;
+    try {
+      voiceChannel = await interaction.guild.channels.fetch(entry.voiceChannelId).catch(() => null);
+    } catch {}
+    if (!voiceChannel) {
+      return interaction.reply({ content: "❌ Voice channel not found.", flags: 64 });
+    }
+    // Add invited user to voice channel permissions
+    let invitedMember = null;
+    try {
+      invitedMember = await interaction.guild.members.fetch(targetId);
+      await voiceChannel.permissionOverwrites.edit(invitedMember.id, { Connect: true });
+    } catch (e) {
+      console.error("Failed to add user to VC permissions:", e);
+      return interaction.reply({ content: "❌ Failed to add user to VC permissions.", flags: 64 });
+    }
+    let invite;
+    try {
+      invite = await voiceChannel.createInvite({ maxUses: 1, unique: true, maxAge: 3600 });
+    } catch (e) {
+      console.error("createInvite error", e);
+      return interaction.reply({ content: "❌ Failed to create invite (permissions?).", flags: 64 });
+    }
+    let targetUser = null;
+    try {
+      targetUser = await interaction.client.users.fetch(targetId).catch(() => null);
+    } catch {}
+    let dmSent = false;
+    if (targetUser) {
+      try {
+        await targetUser.send(`🤝 You have been invited to join a voice channel by <@${ownerId}>: ${invite.url}`);
+        dmSent = true;
+      } catch {
+        dmSent = false;
+      }
+    }
+    return interaction.reply({
+      content: dmSent
+        ? `✅ Invite created and DM sent to <@${targetId}>! (Expires in 1h / 1 use)\n🔓 You have also been granted access to the VC.`
+        : `✅ Invite created: ${invite.url}\n🔓 You have also been granted access to the VC.\n⚠️ Could not DM <@${targetId}>. Share the link manually.`,
+      flags: 64,
+    });
   }
 }
 
-    // Buttons
+// Buttons
     if (interaction.isButton()) {
       const id = interaction.customId || "";
 
@@ -820,7 +975,6 @@ if (interaction.isModalSubmit()) {
         setTimeout(() => interaction.channel.delete().catch(() => {}), 3000);
         return;
       }
-
       // Permanent VC hub create button
       if (id === "vc_create") {
         const userId = interaction.user.id;
@@ -888,6 +1042,7 @@ try {
     new ButtonBuilder().setCustomId(`vc_lock_${userId}`).setLabel("🔒 Lock").setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId(`vc_unlock_${userId}`).setLabel("🔓 Unlock").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`vc_rename_${userId}`).setLabel("✏️ Rename").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`vc_invite_${userId}`).setLabel("🤝 Invite").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`vc_delete_${userId}`).setLabel("🗑️ Delete").setStyle(ButtonStyle.Secondary),
   );
 
@@ -966,16 +1121,19 @@ if (!isOwner && !isAdmin) {
           modal.addComponents(new ActionRowBuilder().addComponents(input));
           return interaction.showModal(modal);
         }
+        if (action === "invite") {
+          const modal = new ModalBuilder().setCustomId(`vc_invite_modal_${ownerId}`).setTitle("Invite to your VC");
+          const input = new TextInputBuilder().setCustomId("vc_invite_user").setLabel("User ID or @mention").setStyle(TextInputStyle.Short).setRequired(true);
+          modal.addComponents(new ActionRowBuilder().addComponents(input));
+          return interaction.showModal(modal);
+        }
 if (action === "delete") {
   try {
     await interaction.reply({
       content: "🗑️ Deleting your VC and controller...",
       ephemeral: true,
     });
-await interaction.followUp({
-  content: "🗑️ Your voice channel and controller have been deleted. You can create a new one anytime with the **Create VC** button.",
-  ephemeral: true,
-});
+
     // Delete the voice channel
     if (voiceChannel) await voiceChannel.delete().catch(() => {});
 
@@ -989,16 +1147,19 @@ await interaction.followUp({
     delete vch[ownerId];
     saveVChData(vch);
 
-    await interaction.editReply({
-      content: "🗑️ Your voice channel and controller have been deleted. You can create a new one anytime with the **Create VC** button.",
-    });
+    // Ensure the original interaction reply is not edited if already deleted
+    if (!interaction.replied) {
+      await interaction.editReply({
+        content: "🗑️ Your voice channel and controller have been deleted. You can create a new one anytime with the **Create VC** button.",
+      }).catch(() => {});
+    }
   } catch (e) {
     console.error("vc delete error", e);
     if (!interaction.replied) {
       await interaction.reply({
         content: "❌ Failed to delete VC and controller.",
         ephemeral: true,
-      });
+      }).catch(() => {});
     }
   }
 }
@@ -1076,5 +1237,135 @@ async function postGuidelinesMessage() {
     )
     .setFooter({ text: "2Hundy Gang" })
     .setTimestamp();
-  await channel.send({ embeds: [embed] });
+
+  const message = await channel.send({ embeds: [embed] });
+  await message.react("✅");
+
+  client.on("messageReactionAdd", async (reaction, user) => {
+    if (reaction.partial) {
+      try {
+        await reaction.fetch();
+      } catch (error) {
+        console.error("Failed to fetch reaction:", error);
+        return;
+      }
+    }
+
+    if (reaction.message.channel.id === GUIDELINES_CHANNEL_ID && reaction.emoji.name === "✅") {
+      const guild = reaction.message.guild;
+      const member = await guild.members.fetch(user.id).catch(() => null);
+      if (!member) {
+        console.error("Member not found for user ID:", user.id);
+        return;
+      }
+
+      const role = guild.roles.cache.find(r => r.name === "Not a Waste Man");
+      if (!role) {
+        console.error("Role 'Not a Waste Man' not found in the guild.");
+        return;
+      }
+
+      if (member.roles.cache.has(role.id)) {
+        console.log(`Member ${user.id} already has the role.`);
+        return;
+      }
+
+      try {
+        await member.roles.add(role);
+        console.log(`Role 'Not a Waste Man' successfully added to member ${user.id}.`);
+      } catch (error) {
+        console.error("Failed to add role to member:", error);
+      }
+    }
+  });
 }
+
+// Post Twitch live info in 'life' channel
+async function postLiveInfo() {
+  const live = await isTwitchLive();
+  const channel = await client.channels.fetch(process.env.LIFE_CHANNEL_ID).catch(() => null);
+  if (!channel || !channel.isTextBased()) return;
+  if (live) {
+    await channel.send({ content: `🔴 **J2hundred is LIVE on Twitch!**\nTitle: ${live.title}\nWatch: https://www.twitch.tv/J2hundred` });
+  } else {
+    await channel.send({ content: `⚪️ J2hundred is currently offline on Twitch.` });
+  }
+}
+
+// Post latest YouTube video in 'youtube' channel
+async function postYouTubeVideo() {
+  const video = await getLatestYouTubeVideo();
+  const channel = await client.channels.fetch(process.env.YOUTUBE_CHANNEL_ID).catch(() => null);
+  if (!channel || !channel.isTextBased() || !video) return;
+  await channel.send({ content: `▶️ **Latest YouTube Video:** [${video.title}](${video.url})`, embeds: [
+    new EmbedBuilder().setTitle(video.title).setURL(video.url).setImage(video.thumbnail)
+  ] });
+}
+
+// Roles embed and reaction role logic
+async function postRolesEmbed() {
+  const channel = await client.channels.fetch(ROLES_MENU_CHANNEL_ID).catch(() => null);
+  if (!channel || !channel.isTextBased()) return;
+  // Check if a roles embed already exists in the last 20 messages
+  const recent = await channel.messages.fetch({ limit: 20 });
+  const found = recent.find(m => m.author.id === client.user.id && m.embeds?.length && m.embeds[0].title === 'Choose Your Roles!');
+  if (found) return;
+  const embed = new EmbedBuilder()
+    .setColor(0x3498db)
+    .setTitle('Choose Your Roles!')
+    .setDescription(`React to get or remove roles:\n\n:video_game: - Games Area\n:mega: - Video Drop Pings\n⭐ - Notified Pings`)
+    .setFooter({ text: '2Hundy Gang Roles' })
+    .setTimestamp();
+  const msg = await channel.send({ embeds: [embed] });
+  await msg.react('🎮');
+  await msg.react('📢');
+  await msg.react('⭐');
+}
+
+client.on('messageReactionAdd', async (reaction, user) => {
+  if (reaction.message.channel.id !== ROLES_MENU_CHANNEL_ID) return;
+  const guild = reaction.message.guild;
+  const member = await guild.members.fetch(user.id).catch(() => null);
+  if (!member) return;
+  let roleId;
+  if (reaction.emoji.name === '🎮') roleId = ROLE_GAMES_ID;
+  if (reaction.emoji.name === '📢') roleId = ROLE_VIDEO_ID;
+  if (reaction.emoji.name === '⭐') roleId = ROLE_NOTIFY_ID;
+  if (roleId && !member.roles.cache.has(roleId)) {
+    await member.roles.add(roleId).catch(() => {});
+  }
+});
+
+client.on('messageReactionRemove', async (reaction, user) => {
+  if (reaction.message.channel.id !== ROLES_MENU_CHANNEL_ID) return;
+  const guild = reaction.message.guild;
+  const member = await guild.members.fetch(user.id).catch(() => null);
+  if (!member) return;
+  let roleId;
+  if (reaction.emoji.name === '🎮') roleId = ROLE_GAMES_ID;
+  if (reaction.emoji.name === '📢') roleId = ROLE_VIDEO_ID;
+  if (reaction.emoji.name === '⭐') roleId = ROLE_NOTIFY_ID;
+  if (roleId && member.roles.cache.has(roleId)) {
+    await member.roles.remove(roleId).catch(() => {});
+  }
+});
+
+const ENSEMBLE_API_ROOT = "https://ensembledata.com/apis";
+const ENSEMBLE_API_TOKEN = process.env.ENSEMBLE_API_TOKEN;
+
+async function checkTwitchFollowerViaEnsemble(username) {
+  try {
+    const endpoint = "/twitch/user/followers";
+    const params = new URLSearchParams({ username, token: ENSEMBLE_API_TOKEN });
+    const url = `${ENSEMBLE_API_ROOT}${endpoint}?${params}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return data; // structure depends on API response
+  } catch (e) {
+    console.error("Ensemble Twitch follower API error", e);
+    return null;
+  }
+}
+// Example usage in verify command:
+// const followerData = await checkTwitchFollowerViaEnsemble(userData.twitchName);
+// if (followerData && followerData.isFollower) { /* grant role */ }
